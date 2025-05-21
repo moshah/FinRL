@@ -9,6 +9,8 @@ from sklearn.base import TransformerMixin
 from sklearn.preprocessing import MaxAbsScaler
 from stockstats import StockDataFrame as Sdf
 
+from statsmodels.tsa.arima.model import ARIMA
+
 from finrl import config
 from finrl.meta.preprocessor.yahoodownloader import YahooDownloader
 
@@ -244,11 +246,84 @@ class FeatureEngineer:
         """
         df = data.copy()
         df["daily_return"] = df.close.pct_change(1)
+        df["momentum"] = df['close'].diff(1)
+        df["ema"] = df['close'].ewm(com=0.5).mean()
         # df['return_lag_1']=df.close.pct_change(2)
         # df['return_lag_2']=df.close.pct_change(3)
         # df['return_lag_3']=df.close.pct_change(4)
         # df['return_lag_4']=df.close.pct_change(5)
+
+        # Add Fourier transform components
+        df = self.add_fft_features(df)
+
+        df = self.add_arima_feature(df)
+
         return df
+
+    def add_fft_features(self, df, price_col='close', components=[3, 6, 9, 100]):
+        """
+        Add Fourier Transform components as features.
+        :param df: pandas dataframe with 'tic' and 'close'
+        :param price_col: which price column to transform
+        :param components: list of number of components to keep
+        :return: modified dataframe
+        """
+        from numpy.fft import fft, ifft
+    
+        result = []
+    
+        for tic in df['tic'].unique():
+            df_tic = df[df['tic'] == tic].copy()
+            close_fft = fft(df_tic[price_col].values)
+    
+            for k in components:
+                fft_k = np.copy(close_fft)
+                fft_k[k:-k] = 0
+                df_tic[f'{price_col}_fft_{k}'] = ifft(fft_k).real
+    
+            result.append(df_tic)
+    
+        return pd.concat(result, ignore_index=True)
+
+
+    def add_arima_feature(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Adds ARIMA-based rolling predictions as a new feature.
+        :param df: DataFrame with 'date', 'tic', and 'close'
+        :return: DataFrame with 'arima_pred'
+        """
+        from statsmodels.tsa.arima.model import ARIMA
+
+        result = []
+
+        for tic in df['tic'].unique():
+            df_tic = df[df['tic'] == tic].copy()
+            df_tic = df_tic.sort_values('date')
+
+            close_series = df_tic['close'].values
+            total_len = len(close_series)
+            train_len = int(total_len * 0.66)
+            history = list(close_series[:train_len])
+            test_len = total_len - train_len
+
+            predictions = [np.nan] * train_len  # pad front part with NaNs
+
+            for t in range(test_len):
+                try:
+                    model = ARIMA(history, order=(5, 1, 0))
+                    model_fit = model.fit(method_kwargs={'maxiter': 50})
+                    yhat = model_fit.forecast()[0]
+                except:
+                    yhat = np.nan
+                predictions.append(yhat)
+                history.append(close_series[train_len + t])  # advance one step
+
+            # Ensure the prediction list matches the df_tic length exactly
+            df_tic['arima_pred'] = predictions[:total_len]
+
+            result.append(df_tic)
+
+        return pd.concat(result, ignore_index=True)
 
     def add_vix(self, data):
         """
